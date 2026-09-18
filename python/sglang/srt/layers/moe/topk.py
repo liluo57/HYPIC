@@ -131,7 +131,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    # Newer sgl-kernel wheels no longer export this legacy MoE op.  Importing
+    # it unconditionally also breaks dense Qwen3.5-family models, even though
+    # they never execute MoE routing.  Keep the optimized path when available
+    # and let the existing fallback handle MoE installs without it.
+    try:
+        from sgl_kernel import moe_fused_gate
+    except ImportError:
+        moe_fused_gate = None
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -1273,6 +1280,7 @@ def biased_grouped_topk_gpu(
 
     elif (
         _is_cuda
+        and moe_fused_gate is not None
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
@@ -1885,7 +1893,7 @@ def select_experts(
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+    @register_fake_if_exists("sgl_kernel::moe_fused_gate")
     def _moe_fused_gate(
         input_tensor,
         bias,

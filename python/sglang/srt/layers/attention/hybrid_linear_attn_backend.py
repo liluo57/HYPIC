@@ -45,6 +45,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.environ import envs
 from sglang.srt.pic.policy import PICCompose
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -1727,7 +1728,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if self._pic_workspace is None:
             self._pic_workspace = torch.empty(
-                128 * 1024 * 1024, dtype=torch.uint8, device=device
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=device,
             )
         if self._pic_rope_global_wrapper is None:
             self._pic_rope_global_wrapper = BatchPrefillWithPagedKVCacheWrapper(
@@ -2290,7 +2293,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if self._pic_workspace is None:
             self._pic_workspace = torch.empty(
-                128 * 1024 * 1024, dtype=torch.uint8, device=device
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=device,
             )
 
         # T1: construct wrapper once, reuse across batches. Recreating per

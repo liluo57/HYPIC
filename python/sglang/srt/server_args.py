@@ -6668,7 +6668,10 @@ class ServerArgs:
         # Heuristic model-arch gate. The authoritative arch check lives in the
         # scheduler assembly (which has access to the resolved HF config).
         # Here we only check known model families by path substring.
-        _PIC_MODEL_PATTERNS = ("Qwen3.5", "Qwen3_5", "Kimi", "kimi", "Ring", "Bailing", "bailing")
+        _PIC_MODEL_PATTERNS = (
+            "Qwen3.5", "Qwen3_5", "Qwen3.8", "Qwen3_8",
+            "Kimi", "kimi", "Ring", "Bailing", "bailing",
+        )
         if not any(p in self.model_path for p in _PIC_MODEL_PATTERNS):
             import logging
             logging.getLogger(__name__).warning(

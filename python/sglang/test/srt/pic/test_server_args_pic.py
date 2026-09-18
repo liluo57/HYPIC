@@ -1,6 +1,7 @@
 import pytest
 from sglang.srt.server_args import ServerArgs
 
+
 def test_pic_flags_exist_with_defaults():
     args = ServerArgs(model_path="dummy")
     assert args.pic_enable is False
@@ -8,9 +9,21 @@ def test_pic_flags_exist_with_defaults():
     assert args.pic_mode == "addition"
     assert args.pic_segment_min_tokens == -1
 
-def test_pic_enable_requires_qwen3_5moe():
-    with pytest.raises(AssertionError, match="Qwen3_5MoeForCausalLM"):
-        ServerArgs(model_path="meta-llama/Llama-3-8B", pic_enable=True)
+
+@pytest.mark.parametrize(
+    "model_arch",
+    [
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+)
+def test_pic_whitelist_covers_qwen3_5_dense_and_moe(model_arch):
+    from sglang.srt.mem_cache.registry import PIC_ALLOWED_ARCHS
+
+    assert model_arch in PIC_ALLOWED_ARCHS
+
 
 def test_pic_enable_requires_chunked_prefill_disabled():
     with pytest.raises(AssertionError, match="chunked_prefill_size"):

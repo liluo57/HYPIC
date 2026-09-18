@@ -26,6 +26,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+PIC_ALLOWED_ARCHS = frozenset(
+    {
+        # Qwen3.8 dense checkpoints resolve to the Qwen3.5 dense runtime
+        # classes and use the same hybrid GDN + full-attention layout.
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "KimiLinearForCausalLM",
+        "BailingMoeLinearV2ForCausalLM",
+        "BailingMoELinearForCausalLM",
+    }
+)
+
+
 @dataclass
 class TreeCacheBuildContext:
     """Radix Cache construction arguments."""
@@ -180,15 +195,8 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.pic.picache import PICache
 
         model_arch = ctx.model_config.hf_config.architectures[0]
-        _PIC_ALLOWED_ARCHS = {
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5MoeForConditionalGeneration",
-            "KimiLinearForCausalLM",
-            "BailingMoeLinearV2ForCausalLM",
-            "BailingMoELinearForCausalLM",
-        }
-        assert model_arch in _PIC_ALLOWED_ARCHS, (
-            f"PIC whitelist: {_PIC_ALLOWED_ARCHS} supported, got {model_arch}"
+        assert model_arch in PIC_ALLOWED_ARCHS, (
+            f"PIC whitelist: {PIC_ALLOWED_ARCHS} supported, got {model_arch}"
         )
         _PIC_ROPE_MODES = {"transition_rope", "transition_rope_recompute"}
         if server_args.pic_mode in _PIC_ROPE_MODES and model_arch == "KimiLinearForCausalLM":

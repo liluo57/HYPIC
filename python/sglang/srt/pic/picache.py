@@ -312,6 +312,8 @@ class PICache(BasePrefixCache):
             "PICache.match_prefix: %d segments, %d hit (%d tokens), %d miss, cache_size=%d entries",
             len(segments), num_hit, hit_tokens, num_miss, len(self._entries),
         )
+        from sglang.srt.pic.cache_debug import maybe_dump_match
+        maybe_dump_match(req, segments, per_seg, hit_tokens)
 
         return MatchResult(
             device_indices=device_indices,
@@ -387,6 +389,12 @@ class PICache(BasePrefixCache):
                 req.pic_segment_entries[seg_hash] = entry
                 req.pic_cache_owned_miss_segments.add((start, end))
                 inserted += 1
+
+                # Diagnostics only: copy the committed entry after all normal
+                # forward writes have completed.  The helper is a no-op unless
+                # PIC_CACHE_DEBUG_DUMP is explicitly set.
+                from sglang.srt.pic.cache_debug import maybe_dump_entry
+                maybe_dump_entry(self, entry)
 
                 # v2 transition fix: protect newly inserted entry until req finishes
                 if is_transition:
