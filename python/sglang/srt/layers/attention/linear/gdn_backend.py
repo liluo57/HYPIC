@@ -546,6 +546,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         batch_size = forward_batch.batch_size
         req_cache_indices = self.forward_metadata.mamba_cache_indices
         p = forward_batch.pic_policy
+        if p.is_linearkv:
+            raise RuntimeError(
+                "LinearKV must not enter HYPIC init_pic_metadata; "
+                "use forward_extend_pic_linearkv instead"
+            )
         is_recompute = p.recompute
         is_addition = p.compose is PICCompose.ADDITION
 
@@ -1097,6 +1102,124 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # (shape (1, seq_len, H_v, V), allocated above in init_pic_metadata
         # under the transition_pool branch which recompute mode also takes).
 
+    def _initialize_linearkv_last_block_state(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Seed each request from its last matched local GDN state.
+
+        This is intentionally a direct rank-local copy. No hit states are
+        summed, no transition matrix is read, and no HYPIC segment-conv chain
+        is constructed. Qwen's runtime state also contains causal-convolution
+        history, so the cached state is restored as the same-block pair
+        ``(temporal_state, conv_tail)``. The paper does not specify this
+        Qwen-specific boundary detail; copying the paired tail preserves the
+        runtime state without invoking HYPIC's cross-segment warm-up.
+        """
+        if not forward_batch.pic_policy.is_linearkv:
+            return
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        ssm_states = cache.temporal
+        conv_tails = self.req_to_token_pool.mamba2_conv_tails_cache(layer.layer_id)
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        src_slots = []
+        dst_slots = []
+        hit_segments = forward_batch.pic_hit_segments or []
+        hit_slot_maps = forward_batch.pic_hit_mamba_slots or []
+        for req_idx in range(forward_batch.batch_size):
+            req_hits = hit_segments[req_idx] if req_idx < len(hit_segments) else []
+            if not req_hits:
+                continue
+            # Context order is the source of truth; never use hash/dict order.
+            _start, _end, seg_hash = max(req_hits, key=lambda x: x[0])
+            src = hit_slot_maps[req_idx].get(seg_hash)
+            if src is None:
+                raise RuntimeError(
+                    "LinearKV matched segment has no recurrent state slot"
+                )
+            src_slots.append(int(src))
+            dst_slots.append(int(cache_indices[req_idx].item()))
+
+        if not src_slots:
+            return
+
+        src = torch.tensor(src_slots, dtype=torch.long, device=ssm_states.device)
+        dst = torch.tensor(dst_slots, dtype=torch.long, device=ssm_states.device)
+        _diag_dump.dump_ssm_state(
+            layer.layer_id, "linearkv_cached_last_block", ssm_states[src[0]]
+        )
+        ssm_states[dst] = ssm_states[src].clone()
+        _diag_dump.dump_ssm_state(
+            layer.layer_id, "linearkv_seed", ssm_states[dst[0]]
+        )
+        if conv_tails is None:
+            raise RuntimeError(
+                "LinearKV requires PIC conv tails for Qwen GDN initialization"
+            )
+        for conv_state, conv_tail in zip(cache.conv, conv_tails):
+            conv_state[dst] = conv_tail[src].clone()
+
+    def _persist_linearkv_independent_state(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Publish state only for a one-segment independent warmup request."""
+        independent = forward_batch.pic_linearkv_independent_prefill or []
+        if not any(independent):
+            return
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        active_states = cache.temporal
+        active_conv = cache.conv
+        conv_tails = self.req_to_token_pool.mamba2_conv_tails_cache(layer.layer_id)
+        cache_indices = self.forward_metadata.mamba_cache_indices
+        miss_segments = forward_batch.pic_miss_segments or []
+        miss_slot_maps = forward_batch.pic_miss_mamba_slots or []
+
+        for req_idx, is_independent in enumerate(independent):
+            if not is_independent or req_idx >= len(miss_segments):
+                continue
+            if len(miss_segments[req_idx]) != 1:
+                continue
+            seg = miss_segments[req_idx][0]
+            dst_slot = miss_slot_maps[req_idx].get(seg)
+            if dst_slot is None:
+                continue
+            src_slot = cache_indices[req_idx]
+            dst_slot_t = torch.tensor(
+                [dst_slot], dtype=torch.long, device=active_states.device
+            )
+            active_states[dst_slot_t] = active_states[src_slot].clone()
+            if conv_tails is not None:
+                for active, tails in zip(active_conv, conv_tails):
+                    tails[dst_slot_t] = active[src_slot].clone()
+
+    def forward_extend_pic_linearkv(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """Run the fused GDN prefill from LinearKV's one cached state."""
+        self._initialize_linearkv_last_block_state(layer, forward_batch)
+        output = self.forward_extend(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            **kwargs,
+        )
+        self._persist_linearkv_independent_state(layer, forward_batch)
+        return output
+
     def forward_extend_pic_addition(
         self,
         layer: RadixLinearAttention,
@@ -1230,6 +1353,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         prefix-parameterized helpers in diag_layer_dump — each dump site is
         one line and the primitives short-circuit when the env is unset.
         """
+        assert not forward_batch.pic_policy.is_linearkv, (
+            "LinearKV must not use HYPIC transition composition"
+        )
         # Recompute mode dispatch: 3-pass interior/seam split (M4).
         if forward_batch.pic_policy.recompute:
             return self.forward_extend_pic_transition_recompute(

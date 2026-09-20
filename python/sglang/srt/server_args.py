@@ -1872,12 +1872,13 @@ class ServerArgs:
     pic_mode: A[
         str,
         Arg(
-            help="PIC composition mode. Only 'addition' is implemented in v1.",
+            help="PIC composition/execution mode.",
             choices=[
                 "addition",
                 "transition",
                 "transition_rope",
                 "transition_rope_recompute",
+                "linearkv",
             ],
         ),
     ] = "addition"
@@ -1885,6 +1886,14 @@ class ServerArgs:
         int,
         "Minimum token length for a segment to be cached. -1 = cache all segments.",
     ] = -1  # -1 = cache all segments regardless of size
+    pic_epic_tokens_per_chunk: A[
+        Optional[int],
+        "LinearKV EPIC/LegoLink fixed repair tokens per matched chunk; mutually exclusive with pic_epic_ratio.",
+    ] = None
+    pic_epic_ratio: A[
+        Optional[float],
+        "LinearKV EPIC/LegoLink repair ratio per matched chunk in [0, 1]; mutually exclusive with pic_epic_tokens_per_chunk.",
+    ] = None
     pic_scatter_timeout_s: A[
         float,
         "Seconds a combine request waits for all scattered segments before abort.",
@@ -6684,6 +6693,28 @@ class ServerArgs:
         assert self.pic_mode in POLICIES, (
             f"pic_mode must be a known enum, got {self.pic_mode!r}"
         )
+        if self.pic_mode == "linearkv":
+            if (
+                self.pic_epic_tokens_per_chunk is not None
+                and self.pic_epic_ratio is not None
+            ):
+                raise ValueError(
+                    "pic_epic_tokens_per_chunk and pic_epic_ratio are mutually exclusive"
+                )
+            if self.pic_epic_tokens_per_chunk is not None and (
+                isinstance(self.pic_epic_tokens_per_chunk, bool)
+                or not isinstance(self.pic_epic_tokens_per_chunk, int)
+                or self.pic_epic_tokens_per_chunk < 0
+            ):
+                raise ValueError(
+                    "pic_epic_tokens_per_chunk must be a non-negative integer"
+                )
+            if self.pic_epic_ratio is not None and (
+                isinstance(self.pic_epic_ratio, bool)
+                or not math.isfinite(float(self.pic_epic_ratio))
+                or not 0.0 <= float(self.pic_epic_ratio) <= 1.0
+            ):
+                raise ValueError("pic_epic_ratio must be a finite number in [0, 1]")
         # transition/transition_rope[_recompute] require Triton linear-attn backend for
         # numerical consistency between state (S_i) and transition matrix (T_i) computation.
         # Both prefill and decode must use the same backend to avoid precision mismatch.

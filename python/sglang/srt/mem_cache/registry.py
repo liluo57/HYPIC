@@ -198,7 +198,11 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         assert model_arch in PIC_ALLOWED_ARCHS, (
             f"PIC whitelist: {PIC_ALLOWED_ARCHS} supported, got {model_arch}"
         )
-        _PIC_ROPE_MODES = {"transition_rope", "transition_rope_recompute"}
+        _PIC_ROPE_MODES = {
+            "transition_rope",
+            "transition_rope_recompute",
+            "linearkv",
+        }
         if server_args.pic_mode in _PIC_ROPE_MODES and model_arch == "KimiLinearForCausalLM":
             raise ValueError(
                 f"PIC mode '{server_args.pic_mode}' requires RoPE on full-attn layers, "

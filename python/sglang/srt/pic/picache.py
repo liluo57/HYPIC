@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LRUStrategy
-from sglang.srt.pic.policy import POLICIES, PICCompose
+from sglang.srt.pic.policy import POLICIES
 from sglang.srt.pic.segmenter import segment_hash
 from sglang.srt.server_args import get_global_server_args
 
@@ -264,8 +264,9 @@ class PICache(BasePrefixCache):
         segments = req.pic_segments
         per_seg: List[Optional[SegmentEntry]] = [None] * len(segments)
 
-        # transition_rope_recompute: re-forward each hit segment's sink seam.
-        is_recompute = self.policy.recompute
+        # HYPIC's recompute mode re-forwards a fixed seam. LinearKV recompute
+        # positions come from its selector and must not be stripped here.
+        is_recompute = self.policy.recompute and not self.policy.is_linearkv
         if is_recompute:
             from sglang.srt.pic import SEAM_SINK_DEFAULT, resolve_seam_sink_tokens
             seam_sink = SEAM_SINK_DEFAULT
@@ -337,8 +338,20 @@ class PICache(BasePrefixCache):
         """
         miss_segments: List = getattr(req, "pic_miss_segments", []) or []
         miss_slots: Dict = getattr(req, "pic_miss_segment_slots", {}) or {}
-        is_transition = self.policy.compose is PICCompose.TRANSITION
+        # LinearKV follows the transition_rope slot-accounting lifecycle
+        # (public state ownership is handed to the cache), but never computes
+        # a transition operator.
+        is_transition = self.policy.uses_transition or self.policy.is_linearkv
         is_rope = self.policy.rope
+
+        # LinearKV only publishes states produced by an independently warmed
+        # one-segment request. A multi-segment online prefill may use its miss
+        # slots transiently, but its joint state is not a reusable local state.
+        if self.policy.is_linearkv and getattr(req, "pic_linearkv_skip_cache", False):
+            req.pic_cache_owned_miss_segments = set()
+            req.pic_freed_miss_segments = set()
+            req.pic_linearkv_uninserted_miss_segments = set(miss_slots)
+            return
 
         inserted = 0
         inflight_tokens = 0
@@ -419,7 +432,7 @@ class PICache(BasePrefixCache):
     def cache_finished_req(self, req, is_insert: bool = True, **kwargs) -> None:
         miss_slots = getattr(req, "pic_miss_segment_slots", None)
         if miss_slots:
-            is_transition = self.policy.compose is PICCompose.TRANSITION
+            is_transition = self.policy.uses_transition or self.policy.is_linearkv
             is_rope = self.policy.rope
             if is_insert:
                 self.cache_unfinished_req(req)
@@ -443,6 +456,33 @@ class PICache(BasePrefixCache):
                         if mamba is not None
                     )
                 self.remove_inflight(inflight_tokens, inflight_mamba)
+
+            # In LinearKV multi-segment requests, public slots and local
+            # mamba slots were allocated only for this request and were not
+            # transferred to the cache. Free those owners explicitly; the
+            # existing private/global cleanup below handles the other slots.
+            if is_rope and getattr(req, "pic_linearkv_skip_cache", False):
+                pic_segments = getattr(req, "pic_segments", None) or []
+                global_seg = tuple(pic_segments[-1]) if len(pic_segments) > 1 else None
+                public_to_free = []
+                local_mamba_to_free = []
+                for seg, (_priv, pub, mamba) in miss_slots.items():
+                    if tuple(seg) == global_seg:
+                        continue
+                    if pub is not None:
+                        public_to_free.append(pub)
+                    if mamba is not None:
+                        local_mamba_to_free.append(mamba)
+                if public_to_free:
+                    public_slots = torch.cat(public_to_free)
+                    self.token_to_kv_pool_allocator.free(public_slots)
+                    self.remove_inflight(public_slots.numel(), 0)
+                if local_mamba_to_free:
+                    device = public_to_free[0].device if public_to_free else miss_slots[next(iter(miss_slots))][0].device
+                    self.mamba_allocator.free(
+                        torch.tensor(local_mamba_to_free, dtype=torch.int64, device=device)
+                    )
+                    self.remove_inflight(0, len(local_mamba_to_free))
             # Free last segment's slots (never cached by design).
             pic_segments = getattr(req, "pic_segments", None)
             if pic_segments and len(pic_segments) > 1:

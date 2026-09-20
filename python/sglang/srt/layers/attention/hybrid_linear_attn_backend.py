@@ -995,6 +995,19 @@ class HybridLinearAttnBackend(AttentionBackend):
         # PIC dispatch: route through mode-specific paths; leave
         # the non-PIC path untouched so existing requests keep working.
         if getattr(forward_batch, "pic_mode", None) is not None:
+            if forward_batch.pic_policy.is_linearkv:
+                return self._forward_extend_pic_linearkv(
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q=q,
+                    k=k,
+                    v=v,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    **kwargs,
+                )
             if forward_batch.pic_policy.compose is PICCompose.ADDITION:
                 return self._forward_extend_pic_addition(
                     layer,
@@ -1037,6 +1050,44 @@ class HybridLinearAttnBackend(AttentionBackend):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **kwargs,
+        )
+
+    def _forward_extend_pic_linearkv(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,
+        a: Optional[torch.Tensor] = None,
+        b: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """LinearKV: FA KV repair plus single-state recurrent replay.
+
+        The FA implementation reuses the existing position-corrected PIC
+        planner, but its repair rows come from the selector rather than the
+        HYPIC seam window. GDN layers seed the ordinary fused prefill kernel
+        from the last matched local state and never construct transitions.
+        """
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        if layer_id in self.full_attn_layers:
+            return self._forward_extend_pic_full_attn_rope(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+
+        return self.linear_attn_backend.forward_extend_pic_linearkv(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            q=q,
+            k=k,
+            v=v,
             **kwargs,
         )
 
@@ -1311,9 +1362,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 entries.extend(range(int(gs), int(ge)))
             # Include seam tokens (hit-segment sink positions) in the
             # q-row mapping so the cross-segment attention plan covers them.
-            seam_info = meta.get("seam") if isinstance(meta, dict) else None
-            if seam_info is not None:
-                hit_seam = seam_info.get("hit_seam", {})
+            repair_info = meta.get("repair") if isinstance(meta, dict) else None
+            if repair_info is not None:
+                hit_seam = repair_info.get("positions", {})
                 for (_s, _e), sink_pos in hit_seam.items():
                     entries.extend(int(p) for p in sink_pos)
             entries.sort()
@@ -1447,7 +1498,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         for req_idx, meta in enumerate(rope_meta):
             local_miss = meta["local_miss"]
             global_info = meta["global"]
-            seam_info = meta.get("seam") if isinstance(meta, dict) else None
+            repair_info = meta.get("repair") if isinstance(meta, dict) else None
             # Collect this req's abs_pos list with kind labels.
             entries: List[Tuple[int, int, object]] = []  # (abs_pos, kind, payload)
             for li, (start, end, _priv, _pub) in enumerate(local_miss):
@@ -1457,8 +1508,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 (gs, ge, _gp) = global_info
                 for ofs in range(ge - gs):
                     entries.append((gs + ofs, 1, -1))
-            if is_recompute and seam_info is not None:
-                hit_seam = seam_info.get("hit_seam", {})
+            if is_recompute and repair_info is not None:
+                hit_seam = repair_info.get("positions", {})
                 for (s, e), sink_pos in hit_seam.items():
                     for j, ap in enumerate(sink_pos):
                         entries.append((ap, 2, ((s, e), j)))
@@ -1493,9 +1544,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 (gs, ge, _gp) = global_info
                 for ofs in range(ge - gs):
                     global_q_indices.append(abs_to_q[gs + ofs])
-            seam_info = meta.get("seam") if isinstance(meta, dict) else None
-            if is_recompute and seam_info is not None:
-                hit_seam = seam_info.get("hit_seam", {})
+            repair_info = meta.get("repair") if isinstance(meta, dict) else None
+            if is_recompute and repair_info is not None:
+                hit_seam = repair_info.get("positions", {})
                 for (s, e), sink_pos in hit_seam.items():
                     for j, ap in enumerate(sink_pos):
                         hit_seam_q_info.append((abs_to_q[ap], req_idx, (s, e), j))
@@ -1806,10 +1857,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         if hit_seam_q_info:
             seam_idx = 0
             for ri, meta in enumerate(rope_meta):
-                seam_info = meta.get("seam") if isinstance(meta, dict) else None
-                if seam_info is None:
+                repair_info = meta.get("repair") if isinstance(meta, dict) else None
+                if repair_info is None:
                     continue
-                hit_seam = seam_info.get("hit_seam", {})
+                hit_seam = repair_info.get("positions", {})
                 for (s, e), sink_pos in hit_seam.items():
                     for j, ap in enumerate(sink_pos):
                         qi = hit_seam_q_info[seam_idx][0]
@@ -2050,9 +2101,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             # semantics and lets early seam Q attend to future KV.
             hit_priv = {(hs, he): p for (hs, he, p, _entry) in meta["local_hit"]}
             seam_q_by_abs = {ap: qi for (qi, ap, _rng, _lofs) in seam_for_req}
-            seam_info = meta.get("seam") if isinstance(meta, dict) else None
-            if seam_info is not None:
-                hit_seam = seam_info.get("hit_seam", {}) or {}
+            repair_info = meta.get("repair") if isinstance(meta, dict) else None
+            if repair_info is not None:
+                hit_seam = repair_info.get("positions", {}) or {}
                 for (s, e), sink_pos in hit_seam.items():
                     priv = hit_priv.get((s, e))
                     if priv is None:
@@ -2250,9 +2301,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             rope_meta = getattr(forward_batch, "pic_rope_meta", None)
             if rope_meta is not None and req_idx < len(rope_meta):
                 meta = rope_meta[req_idx]
-                seam_info = meta.get("seam") if isinstance(meta, dict) else None
-                if seam_info is not None:
-                    hit_seam = seam_info.get("hit_seam", {})
+                repair_info = meta.get("repair") if isinstance(meta, dict) else None
+                if repair_info is not None:
+                    hit_seam = repair_info.get("positions", {})
                     total_seam = sum(len(sp) for sp in hit_seam.values())
                     if total_seam > 0:
                         # Find the max KV length for this request's miss segs

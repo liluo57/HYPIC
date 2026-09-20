@@ -185,6 +185,8 @@ def _pic_alloc_transition_rope(batch) -> Tuple[torch.Tensor, torch.Tensor, List[
     hit_cursor = 0
     total_mamba_alloc = 0
     # For recompute mode: build per-req per-token slot map keyed by absolute pos.
+    # LinearKV uses selector positions; transition_rope_recompute uses HYPIC's
+    # fixed seam positions. The allocator only needs the resulting slot map.
     per_req_slot_at_pos: List[Dict[int, torch.Tensor]] = []
     for i, req in enumerate(batch.reqs):
         req.pic_miss_segment_slots = {}
@@ -214,9 +216,14 @@ def _pic_alloc_transition_rope(batch) -> Tuple[torch.Tensor, torch.Tensor, List[
             )
             # Recompute: hit-seg seam tokens re-enter forward; map abs pos to slot.
             if is_recompute:
-                seam = getattr(req, "pic_hit_seam_positions", {}).get((start, end))
-                if seam is not None:
-                    for ap in seam:
+                repair_positions = (
+                    getattr(req, "pic_linearkv_selected_positions", {})
+                    if _policy is not None and _policy.is_linearkv
+                    else getattr(req, "pic_hit_seam_positions", {})
+                )
+                selected = repair_positions.get((start, end))
+                if selected is not None:
+                    for ap in selected:
                         ofs = int(ap) - start
                         slot_at_pos[ap] = private_slots[ofs:ofs + 1]
 
@@ -248,11 +255,13 @@ def _pic_alloc_transition_rope(batch) -> Tuple[torch.Tensor, torch.Tensor, List[
         per_req_slot_at_pos.append(slot_at_pos)
 
     if is_recompute:
-        # Build out_cache_loc by walking pic_miss_token_positions (real-pos
+        # Build out_cache_loc by walking the online positions (real-pos
         # sorted) per req, looking up slot_at_pos.
         out_chunks: List[torch.Tensor] = []
         for i, req in enumerate(batch.reqs):
-            pos = req.pic_miss_token_positions
+            pos = getattr(req, "pic_online_token_positions", None)
+            if pos is None:
+                pos = req.pic_miss_token_positions
             if pos is None:
                 continue
             slot_at_pos = per_req_slot_at_pos[i]

@@ -853,6 +853,11 @@ class Req(ReqDllmMixin):
         self.pic_miss_segments: List[Tuple[int, int]] = []
         self.pic_segment_entries: Dict[bytes, "SegmentEntry"] = {}
         self.pic_miss_token_positions: Optional[torch.Tensor] = None
+        # LinearKV selector output.  Unlike HYPIC's fixed seam positions, this
+        # is an arbitrary set of hit-token positions chosen by the selector.
+        self.pic_linearkv_selected_positions: Dict[Tuple[int, int], List[int]] = {}
+        self.pic_online_token_positions: Optional[torch.Tensor] = None
+        self.pic_linearkv_skip_cache: bool = False
         # transition_rope_recompute: per-hit-segment seam absolute positions
         # (real-pos in fill_ids). When set, hit-seg sink tokens are
         # treated as miss tokens (re-forwarded; their K/V written into the
@@ -1178,6 +1183,9 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
+            self.pic_linearkv_skip_cache = False
+            self.pic_linearkv_selected_positions = {}
+            self.pic_online_token_positions = None
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1240,14 +1248,45 @@ class Req(ReqDllmMixin):
                     )
                     if e is None
                 ]
-                positions: list = []
-                for (start, end) in self.pic_miss_segments:
-                    positions.extend(range(start, end))
+                policy = getattr(tree_cache, "policy", None)
+                if policy is not None and policy.is_linearkv:
+                    # A cache entry is valid only when this request contains
+                    # exactly one reusable segment and was therefore an
+                    # independent prefill. Multi-segment online requests may
+                    # still use miss tokens, but must not publish their joint
+                    # recurrent state as a reusable local state.
+                    self.pic_linearkv_skip_cache = len(self.pic_segments) != 1
+                    from sglang.srt.pic.selector import (
+                        merge_online_positions,
+                        select_epic_positions,
+                    )
+
+                    server_args = get_global_server_args()
+                    tokens_per_chunk = getattr(
+                        server_args, "pic_epic_tokens_per_chunk", None
+                    )
+                    epic_ratio = getattr(server_args, "pic_epic_ratio", None)
+                    self.pic_linearkv_selected_positions = select_epic_positions(
+                        self.pic_hit_segments,
+                        tokens_per_chunk=tokens_per_chunk,
+                        ratio=epic_ratio,
+                    )
+                    positions = merge_online_positions(
+                        self.pic_miss_segments,
+                        self.pic_linearkv_selected_positions,
+                    )
+                    self.pic_online_token_positions = torch.tensor(
+                        positions, dtype=torch.int64
+                    ) if positions else None
+                else:
+                    positions = []
+                    for (start, end) in self.pic_miss_segments:
+                        positions.extend(range(start, end))
                 # transition_rope_recompute: hit-seg seam tokens are also
                 # extend tokens (re-forwarded). Append them in real-pos order
                 # so positions align with input_ids order.
                 hit_seam = getattr(self, "pic_hit_seam_positions", None)
-                if hit_seam:
+                if hit_seam and not (policy is not None and policy.is_linearkv):
                     seam_positions: list = []
                     for (s, e), sink_pos in hit_seam.items():
                         seam_positions.extend(sink_pos)
@@ -1261,6 +1300,8 @@ class Req(ReqDllmMixin):
                     self.pic_miss_token_positions = torch.tensor(
                         positions, dtype=torch.int64
                     )
+                    if policy is not None and policy.is_linearkv:
+                        self.pic_online_token_positions = self.pic_miss_token_positions
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -2082,8 +2123,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(self.tree_cache, PICache):
             input_ids = []
             for r in self.reqs:
-                if r.pic_miss_token_positions is not None:
+                pos = getattr(r, "pic_online_token_positions", None)
+                if pos is None:
                     pos = r.pic_miss_token_positions
+                if pos is not None:
                     fill = r.get_fill_ids()
                     input_ids.append(array("q", (fill[i] for i in pos.tolist())))
                 else:

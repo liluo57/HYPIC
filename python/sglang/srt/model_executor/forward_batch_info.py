@@ -615,8 +615,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #   "local_miss": List[(start, end, private_slots, public_slots)]
     #   "local_hit":  List[(start, end, private_slots, entry_public_slots)]
     #   "global":     (start, end, private_slots) | None
+    #   "seam":      legacy HYPIC fixed-seam metadata (kept for old backends)
+    #   "repair":    generic selected-token repair metadata
     # All slot tensors are int64 on device.
     pic_rope_meta: Optional[List[Dict[str, object]]] = None
+    # LinearKV selector output: per-request segment -> absolute repair positions.
+    pic_linearkv_selected_positions: Optional[
+        List[Dict[Tuple[int, int], List[int]]]
+    ] = None
+    pic_linearkv_independent_prefill: Optional[List[bool]] = None
 
     @property
     def pic_policy(self):
@@ -748,6 +755,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.pic_mode = batch.pic_mode
             ret.pic_hit_segments = [r.pic_hit_segments for r in batch.reqs]
             ret.pic_miss_segments = [r.pic_miss_segments for r in batch.reqs]
+            if _pic_policy.is_linearkv:
+                ret.pic_linearkv_selected_positions = [
+                    getattr(r, "pic_linearkv_selected_positions", {})
+                    for r in batch.reqs
+                ]
+                ret.pic_linearkv_independent_prefill = [
+                    not getattr(r, "pic_linearkv_skip_cache", False)
+                    for r in batch.reqs
+                ]
             # For GDN linear-attn lapic_addition: mamba slot lookups.
             ret.pic_hit_mamba_slots = [
                 {
@@ -809,20 +825,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                             if info is not None:
                                 priv, entry_pub = info
                                 local_hit.append((start, end, priv, entry_pub))
-                    # transition_rope_recompute: per hit/miss seg seam offsets.
-                    # Maps to absolute positions in fill_ids (real-pos), used by
-                    # Phase C to find batch-local indices of seam Q tokens.
+                    # HYPIC uses fixed seam positions; LinearKV uses selector
+                    # positions. Keep the legacy `seam` key for old HYPIC
+                    # linear backends, while `repair` is the generic planner
+                    # key consumed by the shared FA implementation.
                     seam_info = None
+                    repair_info = None
                     if _pic_policy.recompute:
-                        hit_seam = getattr(r, "pic_hit_seam_positions", {}) or {}
-                        seam_info = {
-                            "hit_seam": hit_seam,  # {(s,e): sink_pos}
+                        repair_positions = (
+                            getattr(r, "pic_linearkv_selected_positions", {})
+                            if _pic_policy.is_linearkv
+                            else getattr(r, "pic_hit_seam_positions", {})
+                        ) or {}
+                        repair_info = {
+                            "positions": repair_positions,
                         }
+                        if not _pic_policy.is_linearkv:
+                            seam_info = {
+                                "hit_seam": repair_positions,
+                            }
                     rope_meta.append({
                         "local_miss": local_miss,
                         "local_hit": local_hit,
                         "global": global_info,
                         "seam": seam_info,
+                        "repair": repair_info,
                     })
                 ret.pic_rope_meta = rope_meta
 
@@ -915,6 +942,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
+                # LinearKV re-forwards selected tokens from hit segments in
+                # addition to ordinary miss tokens.  Those rows are present
+                # in `batch.input_ids`, but are deliberately not removed from
+                # Req.prefix_indices because their cached FA KV remains the
+                # source for the other positions.  The scheduler's
+                # `req.extend_input_len` therefore still counts only the
+                # logical cache miss.  Linear-attention kernels, however,
+                # need the number of *physical online rows* and their packed
+                # cu-seqlens.  Keep scheduler accounting untouched and use
+                # the PIC online stream only in ForwardBatch metadata.
+                if batch.pic_mode == "linearkv" and batch.reqs is not None:
+                    linearkv_extend_seq_lens = []
+                    for req in batch.reqs:
+                        online_positions = getattr(
+                            req, "pic_online_token_positions", None
+                        )
+                        if online_positions is None:
+                            linearkv_extend_seq_lens.append(req.extend_input_len)
+                        else:
+                            linearkv_extend_seq_lens.append(
+                                int(online_positions.numel())
+                            )
+                    if sum(linearkv_extend_seq_lens) != batch.extend_num_tokens:
+                        raise RuntimeError(
+                            "LinearKV online-token metadata disagrees with packed input: "
+                            f"lens={linearkv_extend_seq_lens}, "
+                            f"packed={batch.extend_num_tokens}"
+                        )
+                    extend_seq_lens = linearkv_extend_seq_lens
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32
                 ).to(device, non_blocking=True)
@@ -951,7 +1007,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if batch.pic_mode is not None and batch.reqs is not None:
                 pic_pos_chunks = []
                 for r in batch.reqs:
-                    pos = getattr(r, "pic_miss_token_positions", None)
+                    pos = getattr(r, "pic_online_token_positions", None)
+                    if pos is None:
+                        pos = getattr(r, "pic_miss_token_positions", None)
                     if pos is None:
                         pic_pos_chunks = None
                         break
@@ -1202,8 +1260,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # cuda-graph buffer registry / eager load_batch). PIC is a
                 # text-prefix-cache path, so miss tokens are text positions.
                 pic_pos = getattr(
-                    batch.reqs[batch_idx], "pic_miss_token_positions", None
+                    batch.reqs[batch_idx], "pic_online_token_positions", None
                 )
+                if pic_pos is None:
+                    pic_pos = getattr(
+                        batch.reqs[batch_idx], "pic_miss_token_positions", None
+                    )
                 if pic_pos is not None:
                     mrope_positions = pic_pos.reshape(1, -1).repeat(3, 1)
                 elif (
